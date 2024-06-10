@@ -4,9 +4,10 @@ from config import DEFAULT_DATA_PATH, EXCEL_FILENAME, EXCEL_SHEET_NAME
 from excel_utils import read_excel
 from data_manipulation import transform_issues
 from issue_reader import fetch_issue_details
-from preprocess import preprocess_issues, create_vocabulary
+from preprocess import preprocess_issues, create_vocabulary, TextAccelerator
 import os
 from topic_analysis import analyze_topics
+from issue_topic_analysis import generate_manual_vs_automatic_graph
 
 
 def download_issue_details_if_not_exist(filepath: str, df: pd.DataFrame):
@@ -71,7 +72,8 @@ def main():
         print()
 
     print("Started: preprocessing issues...")
-    preprocessed_df = preprocess_issues(issue_details_df)
+    accelerator = TextAccelerator()
+    preprocessed_df = preprocess_issues(issue_details_df, accelerator)
     print("Finished: preprocessing issues...")
 
     preprocessed_output_path = os.path.join(
@@ -86,7 +88,10 @@ def main():
     print(f"Saved vocabulary in {vocab_output_path}")
 
     # Topic modelling
-    analyze_topics()
+    analyze_topics(save_dtm=True)
+
+    # Issue-Topic Analysis
+    generate_manual_vs_automatic_graph(show_plot=False)
 
 
 if __name__ == '__main__':

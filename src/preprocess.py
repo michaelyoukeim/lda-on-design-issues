@@ -1,4 +1,5 @@
 import os
+import sys
 import pandas as pd
 import re
 import nltk
@@ -8,27 +9,49 @@ from nltk.stem import WordNetLemmatizer
 from nltk.corpus import wordnet
 import string
 import contractions
-from config import ACCELERATOR_LIB_PATH
+from config import ACCELERATOR_LIB_PATH, DEFAULT_DATA_PATH
 from collections import Counter
 
-# Ensure NLTK data is available
-nltk.download('stopwords')
-nltk.download('wordnet')
-nltk.download('punkt')
-nltk.download('averaged_perceptron_tagger')
+# Download necessary NLTK resources at the start of your script
+nltk_resources = ['stopwords', 'wordnet',
+                  'punkt', 'averaged_perceptron_tagger']
 
-# Attempt to import the accelerator module
-accelerator = None
-if os.path.exists(ACCELERATOR_LIB_PATH):
-    try:
-        import sys
-        sys.path.append(os.path.dirname(ACCELERATOR_LIB_PATH))
-        import accelerator
-        print("Accelerator module loaded successfully.")
-    except ImportError as e:
-        print(f"Failed to load accelerator module: {e}")
-else:
-    print(f"Accelerator module not found at {ACCELERATOR_LIB_PATH}.")
+for resource in nltk_resources:
+    nltk.download(resource, quiet=True)
+
+
+class TextAccelerator:
+    def __init__(self):
+        self.accelerator = self.initialize_accelerator()
+
+    def initialize_accelerator(self):
+        if os.path.exists(ACCELERATOR_LIB_PATH):
+            try:
+                sys.path.append(os.path.dirname(ACCELERATOR_LIB_PATH))
+                import accelerator
+                print("Accelerator module loaded successfully.")
+                return accelerator
+            except ImportError as e:
+                print(f"Failed to load accelerator module: {e}")
+        else:
+            print(f"Accelerator module not found at {ACCELERATOR_LIB_PATH}.")
+        return None
+
+    def clean_text_with_rust(self, texts: pd.Series) -> pd.Series:
+        if self.accelerator is None:
+            print("Rust accelerator module not available. Returning empty text.")
+            return pd.Series(["" for _ in texts])
+
+        try:
+            cleaned_texts = self.accelerator.bulk_clean_text_parallel(
+                texts.tolist(), "remove", os.cpu_count())
+            print(
+                f"Cleaned {len(cleaned_texts)} texts using Rust accelerator.")
+        except Exception as e:
+            print(f"Error using Rust accelerator: {e}")
+            return pd.Series(["" for _ in texts])
+
+        return pd.Series(cleaned_texts)
 
 
 def concatenate_texts(summary: str, description: str) -> str:
@@ -37,25 +60,6 @@ def concatenate_texts(summary: str, description: str) -> str:
     if pd.isna(description):
         description = ""
     return summary + " " + description
-
-
-def clean_text_with_rust(texts: pd.Series) -> pd.Series:
-    if accelerator is None:
-        print("Rust accelerator module not available. Returning empty text.")
-        return pd.Series(["" for _ in texts])
-
-    try:
-        cleaned_texts = accelerator.bulk_clean_text_parallel(
-            texts.tolist(), "remove", os.cpu_count())
-        print(f"Cleaned {len(cleaned_texts)} texts using Rust accelerator.")
-    except Exception as e:
-        print(f"Error using Rust accelerator: {e}")
-        return pd.Series(["" for _ in texts])
-
-    # Replace dashes with spaces to keep words separate
-    cleaned_texts = [re.sub(r'-', ' ', text) for text in cleaned_texts]
-
-    return pd.Series(cleaned_texts)
 
 
 def normalize_text(text: str) -> str:
@@ -70,6 +74,13 @@ def to_lowercase(text: str) -> str:
     return text.lower()
 
 
+def remove_special_characters(text: str) -> str:
+    # Remove dashes at the start and end of each token
+    text = text.strip('-')
+    # Remove special characters except alphanumeric, spaces, and dashes
+    return re.sub(r'[^a-zA-Z0-9\s-]', '', text)
+
+
 def remove_stop_words(text: str) -> str:
     stop_words = set(stopwords.words('english'))
     words = nltk.word_tokenize(text)
@@ -80,10 +91,8 @@ def remove_stop_words(text: str) -> str:
 def get_wordnet_pos(word):
     """Map POS tag to first character lemmatize() accepts"""
     tag = nltk.pos_tag([word])[0][1][0].upper()
-    tag_dict = {"J": wordnet.ADJ,
-                "N": wordnet.NOUN,
-                "V": wordnet.VERB,
-                "R": wordnet.ADV}
+    tag_dict = {"J": wordnet.ADJ, "N": wordnet.NOUN,
+                "V": wordnet.VERB, "R": wordnet.ADV}
     return tag_dict.get(tag, wordnet.NOUN)
 
 
@@ -112,13 +121,24 @@ def remove_extra_whitespace(text: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 
-def preprocess_issues(df: pd.DataFrame) -> pd.DataFrame:
+def replace_ontology_classes(text: str) -> str:
+    ontology_classes = pd.read_excel(os.path.join(
+        DEFAULT_DATA_PATH, 'ontology_sheet_1.xlsx'))
+    replaced_text = text
+    for column in ontology_classes.columns:
+        for index, value in ontology_classes[column].dropna().items():
+            replaced_text = re.sub(r'\b{}\b'.format(
+                re.escape(value.strip())), column, replaced_text)
+    return replaced_text
+
+
+def preprocess_issues(df: pd.DataFrame, accelerator: TextAccelerator) -> pd.DataFrame:
     concatenated_texts = df.apply(lambda row: concatenate_texts(
         row['summary'], row['description']), axis=1)
     print("Step 1 - Concatenated Texts:")
     print(concatenated_texts.head())
 
-    cleaned_texts = clean_text_with_rust(concatenated_texts)
+    cleaned_texts = accelerator.clean_text_with_rust(concatenated_texts)
     print("Step 2 - Cleaned Texts:")
     print(cleaned_texts.head())
 
@@ -134,24 +154,32 @@ def preprocess_issues(df: pd.DataFrame) -> pd.DataFrame:
     print("Step 5 - Lowercase Texts:")
     print(lowercase_texts.head())
 
-    no_numbers_texts = lowercase_texts.apply(remove_numbers)
-    print("Step 6 - No Numbers Texts:")
+    no_special_chars_texts = lowercase_texts.apply(remove_special_characters)
+    print("Step 6 - No Special Characters Texts:")
+    print(no_special_chars_texts.head())
+
+    no_numbers_texts = no_special_chars_texts.apply(remove_numbers)
+    print("Step 7 - No Numbers Texts:")
     print(no_numbers_texts.head())
 
     no_punctuation_texts = no_numbers_texts.apply(remove_punctuation)
-    print("Step 7 - No Punctuation Texts:")
+    print("Step 8 - No Punctuation Texts:")
     print(no_punctuation_texts.head())
 
     no_stop_words_texts = no_punctuation_texts.apply(remove_stop_words)
-    print("Step 8 - No Stop Words Texts:")
+    print("Step 9 - No Stop Words Texts:")
     print(no_stop_words_texts.head())
 
     lemmatized_texts = no_stop_words_texts.apply(lemmatize_text)
-    print("Step 9 - Lemmatized Texts:")
+    print("Step 10 - Lemmatized Texts:")
     print(lemmatized_texts.head())
 
     final_texts = lemmatized_texts.apply(remove_extra_whitespace)
-    print("Step 10 - Final Cleaned Texts:")
+    print("Step 11 - Final Cleaned Texts:")
+    print(final_texts.head())
+
+    final_texts = final_texts.apply(replace_ontology_classes)
+    print("Step 12 - Replace Ontology Classes:")
     print(final_texts.head())
 
     df['cleaned_text'] = final_texts
